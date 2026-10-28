@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "智慧树看课助手（本机）",
+  "version": "1.18.6",
+  "description": "弹题作答、播完切下一课、每日时长上限、掉线提醒。配合本机 CDP 点击外挂使用（Ubuntu）。",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://studyvideoh5.zhihuishu.com/*",
+        "https://*.zhihuishu.com/stuStudy*",
+        "https://login.zhihuishu.com/*"
+      ],
+      "js": [
+        "zhs.user.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8971/*"
+  ]
+}
