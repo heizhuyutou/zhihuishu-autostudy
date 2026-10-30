@@ -5,7 +5,7 @@
 PROFILE="$HOME/zhs-profile"
 START="$HOME/.local/share/zhs-clicker/start.sh"
 LOG="$HOME/.local/share/zhs-clicker/supervise.log"
-STUDY="https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=4e5f5a59455a4859454a585958435b4b5a"
+STUDY="https://wisdom-mooc.zhihuishu.com/study/index?recruitAndCourseId=4e5e5c51425d4859454a5859594559425b"
 stray=0
 starts=()
 helperAt=0

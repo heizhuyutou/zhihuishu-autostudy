@@ -1,7 +1,7 @@
 #!/bin/bash
 # 打开"看课专用"的 Chromium：独立配置目录，只装我们这一个扩展。
 # 装好后开机自动跑（~/.config/autostart/zhs-chromium.desktop），也可以手动双击运行。
-URL="https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=4e5f5a59455a4859454a585958435b4b5a"
+URL="https://wisdom-mooc.zhihuishu.com/study/index?recruitAndCourseId=4e5e5c51425d4859454a5859594559425b"
 PROFILE="$HOME/zhs-profile"
 EXT="$HOME/zhs-ext"
 CHROME="/snap/bin/chromium"

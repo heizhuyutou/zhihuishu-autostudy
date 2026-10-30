@@ -49,7 +49,8 @@
   };
 
   const log = (...a) => { if (CFG.debug) console.log('[zhs]', ...a); };
-  const VERSION = '1.18.7';   // 与 @version 同步；显示在角标上，用来确认浏览器里跑的是哪一版
+  const VERSION = '1.19.0';   // 与 @version 同步；显示在角标上，用来确认浏览器里跑的是哪一版
+  try { window.__zhsRan = VERSION; } catch (e) { /* 诊断标记：确认内容脚本注入了 */ }
   const rand = () => Math.floor(Math.random() * CFG.jitter);
 
   // ================= 每日观看时长上限 =================
@@ -904,7 +905,7 @@
 
   // ================= 弹窗按钮 =================
   function findSubmit(dialog) {
-    const b = clickable(dialog, /^(提交|提交答案|交卷|提交并继续|确认提交|submits?)(！)?$/i, 'button, a, div, span, li, input');
+    const b = clickable(dialog, /^(提交|提交答案|提交作答|交卷|提交并继续|确认提交|submits?)(！)?$/i, 'button, a, div, span, li, input');
     if (b) return b;
     // 没有明确提交按钮时：选项已被选中、且弹层里没有"关闭/继续"类按钮，才把"确定"当提交
     const selected = dialog.querySelector('.active, .isSelect, .selected, [class*="checked"], input:checked');
@@ -1001,6 +1002,84 @@
     return true;
   }
   nudgeCatalogList.n = 0;
+
+  // ================= wisdom-mooc 课程场景（2026-10 每日课程）=================
+  // 实测结构：章节折叠面板(el-collapse) + .chapter-item 课时行；看完的条目带 img.finish-icon；
+  // 当前课 = .chapter-item.current；进度条节点 #current-node-box .title 显示"知识点：xxx"；
+  // 弹题是 AI随堂练习弹窗(.ai-class-exercise-dialog)，一次可能挂多个小题(.ques-list .item)，共用一个"提交作答"。
+  // 52 个课时条目全在 DOM 里（折叠章节只是不可见），所以定位/切课看全量条目、要跨章就先展开。
+  const MOOC = /^wisdom-mooc\./.test(location.hostname);
+  // 免考知识点（掌握度页实测 16 个；页面明示"该知识点为免考知识点，不计入掌握度"→ 不进成绩）。
+  // 换课时照掌握度页的蓝色格子更新这两个清单；拿不准的场景一律默认不自动答。
+  const MOOC_EXEMPT_POINTS = ['映射', '有界集', '确界原理', '数列极限的精确定义', '斐波那契数列', '归结原则',
+    '连续函数的局部性质', '反函数的导数', '微分的运算法则', '高阶微分',
+    '不定积分的概念', '降幂法', '升幂法', '循环法', '递推法', '可积条件'];
+  // 整节课的知识点全是免考的课时：这些课时上的弹题随便答都不影响成绩
+  const MOOC_EXEMPT_LESSONS = [/有界集\s*确界原理/, /斐波那契数列/, /归结原则/, /定积分的概念/];
+  const moocExpandTried = new Set();
+
+  function moocAllItems(doc) {
+    return Array.prototype.slice.call(doc.querySelectorAll('.chapter-item'));
+  }
+  function moocFirstUnfinished(doc) {
+    for (const el of moocAllItems(doc)) {
+      if (el.querySelector('.finish-icon')) continue;   // 看完的跳过
+      return el;
+    }
+    return null;
+  }
+  function moocLessonDone(doc) {
+    const cur = doc.querySelector('.chapter-item.current');
+    if (!cur) return null;
+    return !!cur.querySelector('.finish-icon');
+  }
+  // 免考判定：先看当前知识点节点（"知识点：xxx"），再看整节全免考的课时白名单；都不中 = 算成绩/判不准，不碰
+  function moocQuizAllowed(doc) {
+    try {
+      const t = ((doc.querySelector('#current-node-box .title') || {}).textContent || '').trim();
+      const kp = t.replace(/^.*知识点[：:]\s*/, '').trim();
+      if (kp && MOOC_EXEMPT_POINTS.indexOf(kp) >= 0) return true;
+      const lesson = ((doc.querySelector('.chapter-item.current .item-box-name') || {}).textContent || '');
+      for (const re of MOOC_EXEMPT_LESSONS) if (re.test(lesson)) return true;
+    } catch (e) { /* 忽略 */ }
+    return false;
+  }
+  // 条目在折叠的章节里：先把它的章节头点开（点过还不出来就交给下一轮）
+  function moocEnsureVisible(doc, el) {
+    if (el.getClientRects && el.getClientRects().length) return true;
+    const item = el.closest ? el.closest('.el-collapse-item') : null;
+    const hdr = item && item.querySelector('.el-collapse-item__header');
+    if (!hdr || moocExpandTried.has(hdr)) return false;
+    moocExpandTried.add(hdr);
+    log('展开折叠章节:', (hdr.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 16));
+    quickJump = true; lastNextAt = 0; endAt = 0; endTarget = 0;
+    if (CFG.helper && HELP.ok !== false) { if (!realClickElement(hdr, '展开章节', () => true)) fireClick(hdr); }
+    else fireClick(hdr);
+    return false;
+  }
+  // 切课：只挑没看完的（看完的不回头重播），跨章先展开
+  function moocNextLesson(doc) {
+    const items = moocAllItems(doc);
+    if (!items.length) return true;   // 目录还没渲染出来：这轮先不动，也别急着判"全看完"
+    let cur = -1;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].classList.contains('current')) { cur = i; break; }
+    }
+    const start = cur >= 0 ? cur + 1 : 0;
+    let target = null;
+    for (let i = start; i < items.length; i++) {
+      const el = items[i];
+      if (el.querySelector('.finish-icon')) continue;
+      target = el; break;
+    }
+    if (!target) { log('mooc: 后面没有没看完的课时'); return false; }
+    if (!moocEnsureVisible(doc, target)) return true;
+    const titleEl = target.querySelector('.item-box-name') || target;
+    log('mooc 切下一课:', (titleEl.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 24));
+    jumpTo(doc, target, titleEl, '切课');
+    return true;
+  }
+
   // studyvideoh5（用户实际播放页，2026-10 从 stustudy.css 挖出的真实结构）
   //   容器 .box-right .list，条目 li：视频课时 li.video、章节标题 .font_gray_inclined、测验 li.chapter-test
   //   当前播放 .current_play；完成/半完成 .time_icofinish / .time_ico_half；进度 .el-progress__text 或 .progress-num
@@ -1019,8 +1098,9 @@
 
   // 课时学完没：读目录里当前项的百分比/完成图标（比 video.ended 更贴近站点判据）
   function lessonDone(doc) {
+    if (MOOC) return moocLessonDone(doc);
     try {
-      const act = doc.querySelector('.box-right .list .current_play');
+      const act = doc.querySelector('.box-right .list li.current_play');
       if (!act) return null;
       if (act.querySelector('.time_icofinish')) return true;
       const tnode = act.querySelector('.el-progress__text, .progress-num, .learningPercentage-span');
@@ -1065,6 +1145,7 @@
   }
 
   function nextLesson(doc) {
+    if (MOOC) return moocNextLesson(doc);
     // 说明：这里不再"看到下一课按钮就点"——那是旧逻辑，而播放器按钮和目录是同一套远程插件渲染的，
     // 合成点击会被忽略，结果是永远卡在当前课时、也不去看目录。现在顺序是：先扫目录（能看见课时就最可靠），
     // 目录里真没有可点的下一课时时，才在下面用【真鼠标】去点"下一节"按钮 / 展开下一章 / 滚动加载。
@@ -1267,9 +1348,31 @@
 
     const now = Date.now();
     if (!q || q.el !== dialog) {
+      // wisdom-mooc 的 AI随堂练习：只在免考知识点上自动答（不进成绩）；其余/判不准一律留人工
+      const moocQuiz = MOOC && dialog.classList.contains('ai-class-exercise-dialog');
+      if (moocQuiz && !moocQuizAllowed(doc)) {
+        deferQuestion(dialog, '非免考或判不准');
+        nag('弹题在计成绩的知识点上，留你手动答', false, 'quiz-manual');
+        return;
+      }
       const opts = getOptions(dialog);
       let queue = [];
-      if (CFG.useDomAnswer) {
+      if (moocQuiz) {
+        // 一次可能挂多个小题：按小题分组作答（单选随机一个、多选全点），再统一"提交作答"
+        const groups = Array.from(dialog.querySelectorAll('.ques-list .item')).filter(vis);
+        for (const gEl of (groups.length ? groups : [dialog])) {
+          const gOpts = getOptions(gEl);
+          if (!gOpts.length) continue;
+          const multi = /多选/.test(textOf(gEl));
+          const picks = multi ? gOpts.map((_, i) => i) : [Math.floor(Math.random() * gOpts.length)];
+          for (const p of picks) {
+            const idx = opts.indexOf(gOpts[p]);
+            if (idx >= 0 && queue.indexOf(idx) < 0) queue.push(idx);
+          }
+        }
+        log('mooc AI随堂练习(免考自动答): 计划点', queue.length, '个选项');
+      }
+      if (CFG.useDomAnswer && !moocQuiz) {
         const ans = domAnswer(dialog);          // 旧版播放器把答案写在页面里，能读就直接点那一个
         if (ans) {
           queue = String(ans).toUpperCase().split('').map(ch => ch.charCodeAt(0) - 65).filter(i => i >= 0 && i < opts.length);
@@ -1351,7 +1454,7 @@
   // 切课验证：点完要确认真的切过去了；没切成 → 补一发合成点击、再不行才拉黑换下一条，绝不干等
   function verifyJump(docs) {
     const el = pendingJump.el;
-    const act = docs.map(d => d.querySelector('.box-right .list li.current_play') || d.querySelector('.current_play')).find(Boolean) || null;
+    const act = docs.map(d => d.querySelector('.box-right .list li.current_play') || d.querySelector('.chapter-item.current') || d.querySelector('.current_play')).find(Boolean) || null;
     const same = !!(act && (act === el || act.contains(el) || el.contains(act)));
     const v = docs.map(d => d.querySelector('video')).find(Boolean) || null;
     const srcChanged = !!(v && pendingJump.src && (v.currentSrc || v.src) !== pendingJump.src);
@@ -1419,13 +1522,24 @@
 
       // 0e) 进页面先定位到第一个没看完的课时（当前这节已经看完时才跳）
       if (!seekDone && !overLimit() && !waitForStart() && !docs.some((d) => findQuestionDialog(d))) {
-        const doc = docs.find((d) => d.querySelector('.box-right .list')) || null;
+        const doc = (MOOC ? docs.find((d) => d.querySelector('.chapter-item')) : docs.find((d) => d.querySelector('.box-right .list'))) || null;
         if (doc) {
           seekDone = true;
-          const act = doc.querySelector('.box-right .list .current_play');
-          const actDone = !!(act && act.querySelector('.time_icofinish'));
-          const target = firstUnfinished(doc);
+          const act = MOOC ? doc.querySelector('.chapter-item.current') : doc.querySelector('.box-right .list .current_play');
+          const actDone = MOOC
+            ? !!(act && act.querySelector('.finish-icon'))
+            : !!(act && act.querySelector('.time_icofinish'));
+          const target = MOOC ? moocFirstUnfinished(doc) : firstUnfinished(doc);
           if (target && (!act || actDone)) {
+            if (MOOC) {
+              if (!moocEnsureVisible(doc, target)) { seekDone = false; activity = '展开章节'; updateBadge(); return; }
+              const titleEl = target.querySelector('.item-box-name') || target;
+              log('定位到第一个没看完的课时:', (titleEl.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 24));
+              activity = '定位未看完课时';
+              updateBadge();
+              jumpTo(doc, target, titleEl, '定位');
+              return;
+            }
             log('定位到第一个没看完的课时:', target.name);
             activity = '定位未看完课时';
             updateBadge();
@@ -1435,6 +1549,13 @@
           // 当前这节已看完、又没有没看完的课时：如果后面只剩测试/标题行，就是这一科全看完了
           // —— 停在这里（不重播、也不去点目录末尾的"平时测试"，那是考试系统、另一套登录）。
           // 后面若还有章节行（折叠着没渲染课时），交给切课逻辑去展开，不在这里下结论。
+          if (!target && MOOC && moocAllItems(doc).length) {
+            doneAll = true; doneNotified = true;
+            log('进页面定位：没有没看完的课时，这一科的视频都看完了');
+            nag('这一科的视频都看完了', true, 'all-done');
+            activity = '全部看完了'; updateBadge();
+            return;
+          }
           if (!target && act && actDone) {
             const rows = Array.prototype.slice.call(doc.querySelectorAll('.box-right .list li'));
             const actIdx = rows.indexOf(act);
@@ -1536,6 +1657,9 @@
   }
 
   if (window !== rootWindow()) return;   // 同源多 frame 时只让最顶层实例干活
+
+  // wisdom-mooc 课程页（每日课程）已接入：走下面同一套主流程 —— 目录/切课用 mooc* 函数，
+  // 弹题只在免考知识点上自动答（免考 = 掌握度页标注"不计入掌握度"、不进成绩的 16 个知识点）。
 
   // 被弹到登录中心 = 登录过期了：只提醒、不装作在干活（这里没有视频，tick 也不会跑）
   if (/^(login|passport)\./.test(location.hostname)) {
