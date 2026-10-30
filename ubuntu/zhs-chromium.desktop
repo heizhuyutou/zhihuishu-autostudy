@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=知到看课（Chromium）
+Comment=自动打开课程页，并看守它（挂了重新打开）
+Exec=__HOME__/.local/share/zhs-clicker/supervise.sh
+Icon=chromium
+Terminal=false
+X-GNOME-Autostart-enabled=true

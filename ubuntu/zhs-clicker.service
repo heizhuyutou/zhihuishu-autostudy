@@ -1,0 +1,14 @@
+[Unit]
+Description=智慧树真鼠标外挂（本机点击服务）
+After=graphical-session.target
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+ExecStart=/usr/bin/python3 %h/.local/share/zhs-clicker/zhs_clicker.py --quiet
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
