@@ -49,7 +49,7 @@
   };
 
   const log = (...a) => { if (CFG.debug) console.log('[zhs]', ...a); };
-  const VERSION = '1.19.0';   // 与 @version 同步；显示在角标上，用来确认浏览器里跑的是哪一版
+  const VERSION = '1.19.1';   // 与 @version 同步；显示在角标上，用来确认浏览器里跑的是哪一版
   try { window.__zhsRan = VERSION; } catch (e) { /* 诊断标记：确认内容脚本注入了 */ }
   const rand = () => Math.floor(Math.random() * CFG.jitter);
 
@@ -67,7 +67,7 @@
   const fmtHM = (sec) => { const s = Math.max(0, Math.floor(sec)); return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); };
   // startAtMin：今天抽到的开播时刻（当天固定的分钟数，-1 = 不限制）
   let WDAY = { date: '', target: 0, watched: 0, startedAt: 0, startAtMin: -1 };
-  let wDirty = false, wSavedAt = 0, wPauseOnce = false;
+  let wDirty = false, wSavedAt = 0, wPauseOnce = false, winPaused = false;
   const ctSeen = new WeakMap();      // video → 上一轮读到的 currentTime
 
   function rollTarget() {
@@ -145,6 +145,40 @@
     } catch (e) { /* 忽略 */ }
     return '';
   }
+  // 安全验证（易盾 / 腾讯防水墙）：整页被遮罩盖住，点什么都是点遮罩。
+  // 绝不代点、不绕——只停手叫人（账号安全第一）。
+  const CAPTCHA_SRC = /(captcha|yidun|turing)/i;
+  // 真的在页面上露着脸吗？（站点的验证码 iframe、易盾 DOM 是提前预加载的，一直挂在 DOM 里）
+  function visibleAt(el, doc) {
+    let r;
+    try { r = rectOf(el); } catch (e) { return false; }
+    if (r.width < 2 || r.height < 2) return false;
+    try {
+      const cw = doc.documentElement.clientWidth || 0, ch = doc.documentElement.clientHeight || 0;
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      if (cw && (cx < 0 || cy < 0 || cx > cw || cy > ch)) return false;
+      const hit = doc.elementFromPoint(cx, cy);
+      if (!hit) return true;                     // 没有命中测试的环境，退回按尺寸判
+      return hit === el || el.contains(hit) || hit.contains(el);
+    } catch (e) { return true; }
+  }
+  function detectCaptcha(docs) {
+    for (const d of docs) {
+      try {
+        for (const pop of d.querySelectorAll('.yidun_popup, [class*="yidun_popup"]')) {
+          const r = rectOf(pop);
+          if (r.width > 200 && r.height > 200 && /安全验证|验证/.test(textOf(pop)) && visibleAt(pop, d)) return '易盾安全验证';
+        }
+        for (const fr of d.querySelectorAll('iframe')) {
+          const src = fr.getAttribute('src') || '';
+          const r = rectOf(fr);
+          if (CAPTCHA_SRC.test(src) && r.width > 120 && r.height > 80 && visibleAt(fr, d)) return '验证码弹窗';
+        }
+      } catch (e) { /* 忽略 */ }
+    }
+    return '';
+  }
+
   function nag(msg, force, key) {
     const now = Date.now();
     // 去重键：默认用全文，但"视频 1141 分钟没动"这种带数字的必须给稳定键，
@@ -161,35 +195,58 @@
       document.title = '⚠ ' + msg + ' | ' + base;
     } catch (e) { /* 忽略 */ }
   }
-  // 会话保活：知到用的是 CAS 票据，长时间一点请求都没有就可能被服务端判闲置回收。
-  // 夜里等 08:00 开播这一段最容易过期（早上一开口就是"需登录"，白等）。
-  // 做法：空闲时每 8 分钟用同源请求碰一下页面本身；被重定向到登录页 = 票没了，立刻叫人。
-  // 间隔随机 6~14 分钟：等间隔本身也是"机器特征"（日志里每 8 分钟一次，太整齐）。
-  let warmAt = 0, warmBad = false;
-  const warmGap = () => (6 + Math.random() * 8) * 60000;
-  function keepWarm(idle) {
-    if (!idle) return;
-    if (Date.now() - warmAt < warmGap()) return;
-    warmAt = Date.now();
+  // 会话保活：夜里等 08:00 开播这段最容易把登录态熬过期（早上一开口就是"需登录"，白等）。
+  // 实测教训（2026-11-01）：光用 fetch 碰页面壳不算站点活动——夜里发了一百来次保活请求，
+  // 登录态照样过期；真正顶用的是整页重载一次，页面自己启动后会发带登录态的接口请求
+  // （10-30 夜里看守每 41 秒重载一次，第二天早上登录态是好的）。所以空闲 60–120 分钟随机
+  // 重载一次；播放中站点自己的学习上报本身就是活动，不用管。重载时刻记在 sessionStorage，
+  // 免得重载完立刻又重载；间隔随机也是防"每小时整点一次"这种机器特征。留了 zhs-warm-log
+  // （localStorage）记每次保活，第二天能核对夜里到底干了什么。
+  let warmAt = Date.now();
+  const warmGap = () => {
+    const m = Number(WCFG.warmGapMin) > 0 ? Number(WCFG.warmGapMin) : 60;
+    return m * 60000 * (1 + Math.random());
+  };
+  function warmLog(kind) {
     try {
-      fetch(location.href, { credentials: 'include', cache: 'no-store' }).then((r) => {
-        if (/passport\.|\/login/i.test(r.url || '')) {
-          if (!warmBad) { warmBad = true; nag('登录已过期（保活请求被跳到登录页）'); }
-        } else if (warmBad) { warmBad = false; log('保活恢复正常'); }
-      }).catch(() => { /* 断网之类：下一轮再试，不吵人 */ });
+      const a = JSON.parse(localStorage.getItem('zhs-warm-log') || '[]');
+      a.push([Date.now(), kind]);
+      localStorage.setItem('zhs-warm-log', JSON.stringify(a.slice(-30)));
     } catch (e) { /* 忽略 */ }
+  }
+  function keepWarm(idle) {
+    const now = Date.now();
+    let last = 0;
+    try { last = Number(sessionStorage.getItem('zhs-warm-at') || 0); } catch (e) { /* 忽略 */ }
+    const mark = () => { try { sessionStorage.setItem('zhs-warm-at', String(Date.now())); } catch (e) { /* 忽略 */ } };
+    if (!idle) {                                   // 在播：站点自己的上报就是活动
+      warmAt = now;
+      if (!last || now - last > 60000) mark();     // 一分钟记一次就够，别每秒写
+      return;
+    }
+    if (q) return;                                 // 弹题正答着：别折腾页面
+    if (!last) { mark(); return; }                 // 刚开页：先记时刻，不急着重载
+    if (now - warmAt < warmGap() || now - last < warmGap()) return;
+    warmAt = now;
+    mark();
+    warmLog('reload');
+    location.reload();
   }
   const overLimit = () => WDAY.target > 0 && WDAY.watched >= WDAY.target;
   const leftSec = () => (WDAY.target > 0 ? Math.max(0, WDAY.target - WDAY.watched) : -1);
 
-  function trackWatch(docs) {
+  // 跨天：清零 + 重抽上限和开播时刻。放 tick 最前面调，不依赖页面有没有在播
+  function rollDay() {
     const t = todayKey();
-    if (WDAY.date !== t) {                       // 跨天了：清零，随机模式重新抽
-      WDAY = { date: t, target: rollTarget(), watched: 0, startedAt: 0, startAtMin: rollStartAt() };
-      wPauseOnce = false;
-      saveDay(true);
-      log('新的一天：观看计时清零', WDAY.target ? '（今日上限 ' + fmtHM(WDAY.target) + '）' : '（不限时）');
-    }
+    if (WDAY.date === t) return false;
+    WDAY = { date: t, target: rollTarget(), watched: 0, startedAt: 0, startAtMin: rollStartAt() };
+    wPauseOnce = false; winPaused = false;
+    saveDay(true);
+    log('新的一天：观看计时清零', WDAY.target ? '（今日上限 ' + fmtHM(WDAY.target) + '）' : '（不限时）');
+    return true;
+  }
+  function trackWatch(docs) {
+    rollDay();
     for (const d of docs) {
       const v = d.querySelector('video');
       if (!v) continue;
@@ -200,7 +257,7 @@
       const dt = ct - prev;
       // 只累加"真在播"的进度：暂停/结束时进度不动，答题和切课的时间天然不计；
       // dt 过大只可能是拖进度条或换片源，不能算成观看
-      if (!v.paused && !v.ended && dt > 0 && dt < 3) {
+      if (!v.paused && !v.ended && dt > 0 && dt < 3 && !waitForStart()) {   // 窗口之前播的不算今天的量
         WDAY.watched += dt; wDirty = true;
         if (!WDAY.startedAt) { WDAY.startedAt = Date.now(); log('今天开始看（' + fmtHM(WDAY.watched) + '）'); }   // 不论谁按的播放，都算今天已开工
       }
@@ -831,6 +888,17 @@
     }
     const pt = pagePoint(el);
     if (!pt) { activity = tag + ':不在可视区'; updateBadge(); return false; }
+    // 落点被别的元素盖住（验证遮罩、弹层）时不点：点了也是点遮罩，还会被当成机器
+    try {
+      const r0 = rectOf(el);
+      const hit = doc.elementFromPoint(r0.left + Math.min(r0.width / 2, 60), r0.top + r0.height / 2);
+      if (hit && hit !== el && !el.contains(hit) && !hit.contains(el)) {
+        activity = tag + ':落点被遮住';
+        updateBadge();
+        log('落点被 ' + ((hit.className || hit.tagName) + '').slice(0, 24) + ' 挡住，先不点');
+        return false;
+      }
+    } catch (e) { /* 忽略 */ }
     if (guard && guard() === false) return false;   // 点击前复核：目标还在、页面仍聚焦
     activity = tag + ':点击';
     updateBadge();
@@ -1009,13 +1077,10 @@
   // 弹题是 AI随堂练习弹窗(.ai-class-exercise-dialog)，一次可能挂多个小题(.ques-list .item)，共用一个"提交作答"。
   // 52 个课时条目全在 DOM 里（折叠章节只是不可见），所以定位/切课看全量条目、要跨章就先展开。
   const MOOC = /^wisdom-mooc\./.test(location.hostname);
-  // 免考知识点（掌握度页实测 16 个；页面明示"该知识点为免考知识点，不计入掌握度"→ 不进成绩）。
-  // 换课时照掌握度页的蓝色格子更新这两个清单；拿不准的场景一律默认不自动答。
-  const MOOC_EXEMPT_POINTS = ['映射', '有界集', '确界原理', '数列极限的精确定义', '斐波那契数列', '归结原则',
-    '连续函数的局部性质', '反函数的导数', '微分的运算法则', '高阶微分',
-    '不定积分的概念', '降幂法', '升幂法', '循环法', '递推法', '可积条件'];
-  // 整节课的知识点全是免考的课时：这些课时上的弹题随便答都不影响成绩
-  const MOOC_EXEMPT_LESSONS = [/有界集\s*确界原理/, /斐波那契数列/, /归结原则/, /定积分的概念/];
+  // 2026-10-31 用户口径：课程视频里弹的题目不进成绩（掌握度页是另一套题库，跟视频弹题无关），
+  // 所以视频里的 AI随堂练习一律自动作答，不再按知识点分流。
+  // 红线只有一条：计入成绩的测验/考试（平时测试、章节/阶段测试、期中期末）绝不碰——独立入口，标题带字样就让路。
+  const GRADED = /(平时测试|阶段测试|章节测试|随堂测试|期末|期中|考试|测验)/;
   const moocExpandTried = new Set();
 
   function moocAllItems(doc) {
@@ -1032,17 +1097,6 @@
     const cur = doc.querySelector('.chapter-item.current');
     if (!cur) return null;
     return !!cur.querySelector('.finish-icon');
-  }
-  // 免考判定：先看当前知识点节点（"知识点：xxx"），再看整节全免考的课时白名单；都不中 = 算成绩/判不准，不碰
-  function moocQuizAllowed(doc) {
-    try {
-      const t = ((doc.querySelector('#current-node-box .title') || {}).textContent || '').trim();
-      const kp = t.replace(/^.*知识点[：:]\s*/, '').trim();
-      if (kp && MOOC_EXEMPT_POINTS.indexOf(kp) >= 0) return true;
-      const lesson = ((doc.querySelector('.chapter-item.current .item-box-name') || {}).textContent || '');
-      for (const re of MOOC_EXEMPT_LESSONS) if (re.test(lesson)) return true;
-    } catch (e) { /* 忽略 */ }
-    return false;
   }
   // 条目在折叠的章节里：先把它的章节头点开（点过还不出来就交给下一轮）
   function moocEnsureVisible(doc, el) {
@@ -1348,11 +1402,11 @@
 
     const now = Date.now();
     if (!q || q.el !== dialog) {
-      // wisdom-mooc 的 AI随堂练习：只在免考知识点上自动答（不进成绩）；其余/判不准一律留人工
+      // wisdom-mooc 的 AI随堂练习：视频里的题目都不进成绩 → 一律自动答；只有像测验/考试的才让路
       const moocQuiz = MOOC && dialog.classList.contains('ai-class-exercise-dialog');
-      if (moocQuiz && !moocQuizAllowed(doc)) {
-        deferQuestion(dialog, '非免考或判不准');
-        nag('弹题在计成绩的知识点上，留你手动答', false, 'quiz-manual');
+      if (moocQuiz && GRADED.test(textOf(dialog))) {
+        deferQuestion(dialog, '像计成绩的测验');
+        nag('这个弹窗像计成绩的测验，留你手动', false, 'quiz-graded');
         return;
       }
       const opts = getOptions(dialog);
@@ -1370,7 +1424,7 @@
             if (idx >= 0 && queue.indexOf(idx) < 0) queue.push(idx);
           }
         }
-        log('mooc AI随堂练习(免考自动答): 计划点', queue.length, '个选项');
+        log('mooc AI随堂练习: 计划点', queue.length, '个选项');
       }
       if (CFG.useDomAnswer && !moocQuiz) {
         const ans = domAnswer(dialog);          // 旧版播放器把答案写在页面里，能读就直接点那一个
@@ -1416,8 +1470,9 @@
     const opts = getOptions(dialog);
     const submit = findSubmit(dialog);
 
-    // 需要"提交"的题型：选完一个就提交（同样走真鼠标）
-    if (submit && q.lastClick > 0 && !q.submitted) {
+    // 需要"提交"的题型：计划点的选项全点完再提交（同样走真鼠标）。
+    // 一次弹窗挂多个小题时"提交作答"是统一提交，先点一个就提交会让后面的小题空着。
+    if (submit && q.lastClick > 0 && !q.submitted && q.idx >= q.queue.length) {
       q.submitted = true;
       q.lastClick = now;
       log('提交当前选项');
@@ -1492,6 +1547,7 @@
     try {
       ensureEnv();
       neuterWarn();
+      rollDay();                        // 跨天先清零，不依赖页面有没有在播
       const docs = collectDocs();
 
       // 0a) 只在有视频的页面活动（播放页才做事，学堂/主页一律不动）
@@ -1517,8 +1573,32 @@
       }
       if (loginWallSeen) { loginWallSeen = false; log('登录已恢复，继续'); }
 
+      // 0c2) 安全验证弹出：整页被遮罩盖住，点什么都是点遮罩 → 停手叫人
+      const capMsg = detectCaptcha(docs);
+      if (capMsg) {
+        activity = '需人工验证';
+        updateBadge();
+        nag('页面弹了' + capMsg + '，请你手点一下，脚本不碰验证码', false, 'captcha');
+        return;
+      }
+      if (/^⚠ /.test(document.title)) {           // 验证过去了就把标题上的感叹号摘掉
+        try { document.title = document.title.replace(/^⚠ [^|]*\| /, ''); } catch (e) { /* 忽略 */ }
+      }
+
       // 0d) 空闲（没在播：等 08:00 / 已到量 / 播完了在等切课）时给会话续命
       keepWarm(!docs.some((d) => { const v = d.querySelector('video'); return v && !v.paused; }));
+
+      // 0d2) 开播窗口之前（00:00 → 今天抽到的 08:xx）不让页面自己播起来：
+      //      站点在重载/换片后会自己 autoplay，放它播一夜就把当天额度提前吃光（今天早上就是这么"没开播"的）
+      if (waitForStart()) {
+        for (const d of docs) {
+          const v = d.querySelector('video');
+          if (v && !v.paused && !v.ended) {
+            try { v.pause(); } catch (e) { /* 忽略 */ }
+            if (!winPaused) { winPaused = true; log('还没到开播时间（' + fmtAtMin(WDAY.startAtMin) + '），先暂停，额度留给早上'); }
+          }
+        }
+      }
 
       // 0e) 进页面先定位到第一个没看完的课时（当前这节已经看完时才跳）
       if (!seekDone && !overLimit() && !waitForStart() && !docs.some((d) => findQuestionDialog(d))) {

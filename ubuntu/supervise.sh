@@ -60,7 +60,8 @@ try:
 except Exception:
     print(""); raise SystemExit
 urls = [p.get("url", "") for p in pages if p.get("type") == "page"]
-ok = any("studyvideoh5.zhihuishu.com" in u or "login.zhihuishu.com" in u for u in urls)
+STUDY_HOSTS = ("studyvideoh5.zhihuishu.com", "wisdom-mooc.zhihuishu.com", "login.zhihuishu.com")
+ok = any(h in u for u in urls for h in STUDY_HOSTS)
 print("" if ok or not urls else "bad")
 PY
 )
